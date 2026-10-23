@@ -2,7 +2,7 @@ name: Markov Telegram alerts
 
 on:
   schedule:
-    - cron: "0 * * * *"
+    - cron: "17 * * * *"
   workflow_dispatch:
     inputs:
       test:
@@ -17,7 +17,7 @@ concurrency:
 jobs:
   watch:
     runs-on: ubuntu-latest
-    timeout-minutes: 75
+    timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -29,7 +29,7 @@ jobs:
           path: state.json
           key: mre-state-${{ github.run_id }}
           restore-keys: mre-state-
-      - run: python mre_bot.py ${{ inputs.test && '--test' || '--minutes 58' }}
+      - run: python mre_bot.py ${{ inputs.test && '--test' || '--minutes 350' }}
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
