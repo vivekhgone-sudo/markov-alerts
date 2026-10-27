@@ -1,4 +1,4 @@
-"""R&V HFMS v7 — Telegram bot. Same rules as the TradingView indicator "Raghu&Vivek Hedge fund Management system v7".
+"""R&V HFMS v8 — Telegram bot. Same rules as the TradingView indicator "Raghu&Vivek Hedge fund Management system v8".
 
 Posts every instruction with EXACT quantities for BTC, ETH and gold (5-minute candles):
 orders, skips, fills + stop orders, trail moves, BTC partial profits, ETH add-on / join, holds, exits,
@@ -32,7 +32,7 @@ SETTINGS = {
     "ACCOUNT_BALANCE": 50000.0,     # ₹ — update whenever it changes
     "HIGHEST_BALANCE": 50000.0,     # ₹ — highest balance reached so far; only ever raise it
     "BASE_RISK_PCT": 0.5,           # % of balance per normal trade at a new high (shrinks automatically below the high)
-    "USD_INR": 105.0,                # ₹ per USDT
+    "USD_INR": 88.0,                # ₹ per USDT
     "LEVERAGE_MAX": 40.0,
     "FED_DATES": "2026-10-28,2026-12-09",   # New York dates of Fed announcements
 }
@@ -64,6 +64,7 @@ STEP_R = 1.0; XAU_BIG = 2.5; JOIN_R = 1.5; ADD_AT = 1.5; ADD_Q = 0.33; OFF = 0.0
 RE_HOURS = 24; LINE_HOURS = 24; MAX_FLIPS = 1
 UNG_MULT = 3.0; UNG_STOP = 1.0; UNG_FROM = 10; UNG_TO = 14; UNG_EXIT_H = 2
 CCI_LEN = 27; CCI_LOOK = 18; CCI_LVL = -100.0
+USE_GRADE = True; GRADE_N = 1.321          # setup grade A+/A/B/C (time + market-map checks); keeps average size the same
 SZ_MIN = 0.25; SZ_MAX = 3.0; SHRINK_AT = 30.0; FLOOR = 25.0
 
 
@@ -130,23 +131,32 @@ def daily_context(rows: list) -> dict:
     out, rng, closes = {}, [], []
     e50 = e200 = None
 
-    def ctx():
+    weeks, hl = {}, []
+
+    def ctx(d):
         med = lambda n: median(rng[-n:]) if len(rng) >= n else None
         s200 = sum(closes[-200:]) / 200 if len(closes) >= 200 else None
         last = closes[-1] if closes else None
+        pw = weeks.get((d + 3) // 7 - 1)                      # previous Monday-Sunday week (UTC)
         return {"m30": med(30), "m10": med(10), "m60": med(60),
                 "a50": None if e50 is None else (1.0 if last > e50 else -1.0),
                 "a200": None if e200 is None else (1.0 if last > e200 else -1.0),
-                "up200": None if s200 is None else last > s200}
+                "up200": None if s200 is None else last > s200,
+                "pdh": hl[-1][0] if hl else None, "pdl": hl[-1][1] if hl else None,
+                "chg": (closes[-1] / closes[-2] - 1) * 100 if len(closes) >= 2 else None,
+                "pwh": pw[0] if pw else None, "pwl": pw[1] if pw else None}
 
     for t, o, h, l, c in rows:
-        out[t // DAY] = ctx()
+        out[t // DAY] = ctx(t // DAY)
+        wk = (t // DAY + 3) // 7
+        weeks[wk] = (max(weeks[wk][0], h), min(weeks[wk][1], l)) if wk in weeks else (h, l)
+        hl.append((h, l))
         rng.append((h - l) / c * 100 if c > 0 else 0.0)
         e50 = c if e50 is None else e50 + 2 / 51 * (c - e50)
         e200 = c if e200 is None else e200 + 2 / 201 * (c - e200)
         closes.append(c)
     if rows:
-        out[rows[-1][0] // DAY + 1] = ctx()          # today (its own candle is still forming)
+        out[rows[-1][0] // DAY + 1] = ctx(rows[-1][0] // DAY + 1)          # today (its own candle is still forming)
     return out
 
 
@@ -190,10 +200,13 @@ def run_coin(coin: str, rows: list, dctx: dict, bctx: dict):
         m = sum(w) / CCI_LEN
         md = sum(abs(x - m) for x in w) / CCI_LEN
         cci[i] = (tp[i] - m) / (0.015 * md) if md > 0 else 0.0
-    hour_hi = {}
+    hour_hi, asia = {}, {}
     for r in rows:
         k = r[0] // HOUR
         hour_hi[k] = max(hour_hi.get(k, r[2]), r[2])
+        if r[0] % DAY < 7 * HOUR:                               # Asia range 00:00-07:00 UTC (05:30-12:30 IST)
+            a = asia.get(r[0] // DAY)
+            asia[r[0] // DAY] = (max(a[0], r[2]), min(a[1], r[3])) if a else (r[2], r[3])
 
     ev = []
     S = dict(pos=0, paper=False, en=None, stp=None, R0=None, scE=1.0, kE=1.0, joinPx=None, joinAdj=0.0, added=False,
@@ -226,14 +239,29 @@ def run_coin(coin: str, rows: list, dctx: dict, bctx: dict):
         def sl_for(typ):
             return (SL[coin][0] if typ == 1 else SL[coin][1]) * volK
 
-        def size_for(d):
+        def size_for(d, typ):
             w50 = a50 is not None and a50 * d > 0
             w200 = a200 is not None and a200 * d > 0
             m = ((1.25 if w50 else 0.75) if crypto else 1.0) * (1.0 if w50 else 0.5) * (1.5 if w200 else 1.0) * (1.0 if calm else 0.5) / 0.714
             why = ("EMA50+ " if w50 else "EMA50- ") + ("EMA200+ " if w200 else "EMA200- ") + ("calm+" if calm else "volatile-")
+            if USE_GRADE:
+                g = 1.0; uh = (t % DAY) // HOUR
+                pdh, pdl, chg, pwh, pwl = dc.get("pdh"), dc.get("pdl"), dc.get("chg"), dc.get("pwh"), dc.get("pwl")
+                ar = asia.get(t // DAY)
+                if uh >= 17: g *= 0.6; why += " late-"
+                if datetime.fromtimestamp(t / 1000, timezone.utc).weekday() >= 5: g *= 0.7; why += " weekend-"
+                if chg is not None and chg * d < -1: g *= 0.7; why += " yday-"
+                if pdl is not None and (c < pdl if d == 1 else c > pdh): g *= 0.6; why += " wrong-side-"
+                if uh >= 7 and ar and (c < ar[1] if d == 1 else c > ar[0]): g *= 0.6; why += " Asia-"
+                st_d = c * sl_for(typ) / 100; lv = pdh if d == 1 else pdl
+                if lv is not None and st_d > 0 and (lv - c) * d / st_d >= 3: g *= 0.7; why += " far-"
+                if pwh is not None and (c > pwh if d == 1 else c < pwl): g *= 1.3; why += " week-break+"
+                m *= g * GRADE_N
             if fed_day and ((crypto and t < fedT) or (coin == "XAU" and t >= fedT + 2 * HOUR)):
                 m *= 0.5; why += " Fed-"
-            return max(SZ_MIN, min(SZ_MAX, m)), why
+            m = max(SZ_MIN, min(SZ_MAX, m))
+            gr = "A+" if m >= 2.0 else "A" if m >= 1.2 else "B" if m >= 0.6 else "C"
+            return m, f"Grade {gr} · " + why
 
         def will_skip(d):
             return S["hasLast"] and (S["lastPct"] >= XAU_BIG * volK if coin == "XAU" else (S["lastRes"] > 0.0001 and d != S["lastSide"]))
@@ -341,7 +369,7 @@ def run_coin(coin: str, rows: list, dctx: dict, bctx: dict):
                 S["reArm"] = (loss_stop and REON[coin] and S["reUsed"] < 1 and pos == S["sigSide"]
                               and t - S["sigT"] <= RE_HOURS * HOUR)
                 if S["reArm"]:
-                    rq = qty_for(S["R0"], size_for(S["sigSide"])[0])
+                    rq = qty_for(S["R0"], size_for(S["sigSide"], S["pendTyp"])[0])
                     say(f"🔵 {nm} RE-ENTRY READY: {side(S['sigSide'])} {qs(rq)} {nm} at market if a 5-min candle closes "
                         f"{'above' if S['sigSide'] == 1 else 'below'} {px(S['sigClose'], coin)} "
                         f"(only until {when(S['sigT'] + RE_HOURS * HOUR)}). I will message you when it happens.")
@@ -417,7 +445,7 @@ def run_coin(coin: str, rows: list, dctx: dict, bctx: dict):
                 S.update(sigClose=c, sigT=t, sigSide=sig_dir, reUsed=0, pendRef=(l if sig_dir == 1 else h), pendRe=False,
                          pendName=sig_name, pendTyp=sig_typ)
                 sk = will_skip(sig_dir)
-                S["oSize"], S["oWhy"] = size_for(sig_dir)
+                S["oSize"], S["oWhy"] = size_for(sig_dir, sig_typ)
                 slpO = sl_for(sig_typ)
                 eO = c * (1 + sig_dir * OFF / 100)
                 S["oDist"] = eO * slpO / 100 if slpO > 0 else abs(eO - (l if sig_dir == 1 else h))
@@ -444,7 +472,7 @@ def run_coin(coin: str, rows: list, dctx: dict, bctx: dict):
             elif (S["sigSide"] == 1 and c > S["sigClose"]) or (S["sigSide"] == -1 and c < S["sigClose"]):
                 d = S["sigSide"]
                 S.update(pend=d, pendRe=True, pendName=("RE-ENTRY BUY" if d == 1 else "RE-ENTRY SELL"))
-                S["oSize"], S["oWhy"] = size_for(d)
+                S["oSize"], S["oWhy"] = size_for(d, S["pendTyp"])
                 S["oDist"] = S["R0"]; S["oQty"] = qty_for(S["R0"], S["oSize"]); S["oLev"] = lev_for(S["R0"] / c * 100)
                 S["reUsed"] += 1; S["reArm"] = False
                 say(f"{'🟢' if d == 1 else '🔴'} {nm} {S['pendName']} — {side(d)} {qs(S['oQty'])} {nm} at market NOW (≈{px(c, coin)}) @ {S['oLev']}x\n"
@@ -540,7 +568,7 @@ def main() -> None:
     if a.test:
         feed.update()
         r, dd = risk_pct()
-        out = [f"✅ R&V v7 bot connected\nBalance ₹{cfg('ACCOUNT_BALANCE'):,.0f} · {dd * 100:.1f}% below high ₹{cfg('HIGHEST_BALANCE'):,.0f} · risk {r:.3f}% per trade"]
+        out = [f"✅ R&V v8 bot connected\nBalance ₹{cfg('ACCOUNT_BALANCE'):,.0f} · {dd * 100:.1f}% below high ₹{cfg('HIGHEST_BALANCE'):,.0f} · risk {r:.3f}% per trade"]
         for name, src, sym, coin in WATCH:
             if coin not in feed.rows:
                 out.append(f"\n{name}: could not load prices"); continue
